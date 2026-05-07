@@ -1,1 +1,1 @@
-# RVAI_project
+# Final project of the Robotics, vision & AI course
