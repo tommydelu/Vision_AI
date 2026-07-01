@@ -1,41 +1,42 @@
 # RUBIK CUBE COLOR RECOGNITION
 
 ## GENERAL PROCESS
-- The purpose of this python script is to detect the colors of each face of the Rubik's cube, so that the robot can decide what the sequence of moves is going to be to solve it.
+* **Objective:** The purpose of this Python script is to accurately detect the colors of each face of the Rubik's cube, enabling the robot to compute the optimal sequence of moves required to solve it.
+* **Image Acquisition & Grid Generation:** Images of all six faces are imported (e.g., in `.jpg`/`.jpeg` format). The script isolates the cube by cropping the center of each image and overlays a $3 \times 3$ grid to locate the 9 individual stickers per face.
+* **Color Processing & Optimization:** To ensure robust color recognition under varying ambient lighting conditions, pixel data is sampled from the median color of each grid cell and converted from BGR to the **CIELAB ($L^*a^*b^*$) color space**. This data can be visualized in a 3D scatter plot using the actual RGB coordinates, while a linear assignment algorithm (Hungarian Method) guarantees that exactly 9 stickers are assigned to each of the 6 colors.
 
-- We import as an image(e.g. ***.jpeg***) all the faces of the cube. On the photo we create a 3x3 grid to detect all the 9 stickers of the cube.
+---
 
-- We process those images to extract and analyze color data. We crop the center of an image, divide it into a 3x3 grid, and sample the median color of each cell. The color values are converted to the CIELAB color space (ideal for robust color recognition under varying lighting conditions) and plotted into a 3D scatter plot using their actual RGB colors.
+## CUBE ROTATIONS & SCANNING PROCESS
 
-## CUBES ROTATIONS & SCANNING PROCESS
+The robot scans each face of the cube sequentially using a dual-gripper system. The routine begins by securing the cube with the right hand, scanning the first three faces via the right hand, and then transitioning control to the left hand for the remaining faces.
 
-The robot reads each face of the cube, starting by picking the cube with its left hand. 
-We scan the first three faces of the cube with the right hand, and then we continue the process with the left hand. 
+### 1. RIGHT HAND SEQUENCE 
+* **Front Face:** The scanning process begins with the camera capturing the Front face.
+* **Left Face:** The robot's right gripper rotates 90° to the right to expose the Left face to the camera.
+* **Back Face:** The gripper returns to its initial position and executes a 180° rotation to scan the Back face.
 
-1. RIGHT HAND SEQUENCE 
-- The process begins with the **Front face**.
-- The gripper of the robot is rotated 90° to the right so it can read the **left face**. 
-- For the **back face** we have to bring the hand back to its initial position (90° to the right and rotate the cube 180°).
+### 2. LEFT HAND SEQUENCE
+* **Top (Up) Face:** The left hand takes control, clamping the cube and rotating it 90° forward to scan the Top face.
+* **Right Face:** A 90° rotation is made to the left to expose the Right face.
+* **Bottom (Down) Face:** Finally, the cube is flipped by 180° from its top position to scan the Bottom face.
 
-2. LEFT HAND SEQUENCE
-- The left hand takes control to scan the remaining faces.
-- With the left hand we pick the cube, and we rotate it 90° to scan the **top face**
-- Next a 90° rotation is made to the left to scan the **right face**
-- Finally, we flip the cube by 180° to scan the **bottom face**.
-
-The diagram below is how we see the cube when we unwrap it, following the sequence of the motions that we are using.
+### Unwrapped Cube Layout
+The diagram below illustrates how the physical sequence of mechanical motions maps onto a flat, unwrapped representation of the cube:
 
 ```
        +-------+
        | FRONT |
-+------+-------+-------+------+
-| LEFT |  UP   | RIGHT | DOWN |
-+------+-------+-------+------+
++------+-------+-------+--------+
+| LEFT |  UP   | RIGHT | BOTTOM |
++------+-------+-------+--------+
        | BACK  |
        +-------+
 ```
+---
 
-### NOTE 
-We have to keep in mind, that when we scan each face, most of them are rotated. So when we create the final string with all the colors detected, we have to rotate them according to the side. 
+### ⚠️ CRITICAL NOTE ON ORIENTATION
+Because the physical robot rotates the cube along different axes during the scanning process, several faces are captured sideways or upside-down relative to the camera's fixed frame of reference. 
 
-For example, the back side is 180° rotated. So we have to rotate the colors upside down.
+For example, the **Back face** is captured with a 180° orientation shift, meaning its color data is read upside-down. To compensate for this, the script mathematically rotates the internal $3 \times 3$ color matrices (e.g., remapping array indices) based on each face's specific perspective before compiling the final 54-character state string required by the Kociemba solver.
+
