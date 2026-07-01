@@ -32,6 +32,75 @@ const char * primitive_arm_name(PrimitiveArm arm)
     return arm == PrimitiveArm::RIGHT ? "right" : "left";
 }
 
+struct PrimitiveJointSnapshot {
+    std::vector<double> right;
+    std::vector<double> left;
+};
+
+bool capture_initial_joint_snapshot(
+    int primitive_value,
+    PrimitiveJointSnapshot & snapshot,
+    const rclcpp::Logger & logger,
+    const PrimitiveContext & context)
+{
+    if (!context.has_joint_state_for_arm(PrimitiveArm::RIGHT) ||
+        !context.has_joint_state_for_arm(PrimitiveArm::LEFT)) {
+        RCLCPP_INFO(
+            logger,
+            "Primitive %d waiting for both arm joint states before saving initial configuration.",
+            primitive_value);
+        return false;
+    }
+
+    snapshot.right = context.joint_state_for_arm(PrimitiveArm::RIGHT);
+    snapshot.left = context.joint_state_for_arm(PrimitiveArm::LEFT);
+    if (snapshot.right.size() < 7 || snapshot.left.size() < 7) {
+        RCLCPP_WARN(
+            logger,
+            "Primitive %d received incomplete initial joint state: right=%zu left=%zu.",
+            primitive_value,
+            snapshot.right.size(),
+            snapshot.left.size());
+        return false;
+    }
+
+    snapshot.right.resize(7);
+    snapshot.left.resize(7);
+    return true;
+}
+
+const std::vector<double> & joints_for_arm(const PrimitiveJointSnapshot & snapshot, PrimitiveArm arm)
+{
+    return arm == PrimitiveArm::RIGHT ? snapshot.right : snapshot.left;
+}
+
+bool return_arm_to_initial_joints(
+    int primitive_value,
+    PrimitiveArm arm,
+    const PrimitiveJointSnapshot & snapshot,
+    int n_segments,
+    const rclcpp::Logger & logger,
+    const PrimitiveContext & context)
+{
+    const auto & joints = joints_for_arm(snapshot, arm);
+    if (joints.size() < 7) {
+        RCLCPP_WARN(
+            logger,
+            "Primitive %d cannot return %s arm: initial joint snapshot is incomplete.",
+            primitive_value,
+            primitive_arm_name(arm));
+        return false;
+    }
+
+    RCLCPP_INFO(
+        logger,
+        "Primitive %d: returning %s arm to initial joint configuration.",
+        primitive_value,
+        primitive_arm_name(arm));
+    context.start_joint_path(joints, n_segments, arm);
+    return true;
+}
+
 tf2::Vector3 project_axis_onto_plane(const tf2::Vector3 & axis, const tf2::Vector3 & normal)
 {
     return axis - normal * axis.dot(normal);
@@ -114,13 +183,52 @@ geometry_msgs::msg::Point point_in_reference_frame(
     return point;
 }
 
+bool start_last_joint_rotation(
+    int primitive_value,
+    PrimitiveArm arm,
+    double angle,
+    int n_segments,
+    const rclcpp::Logger & logger,
+    const PrimitiveContext & context)
+{
+    if (!context.has_joint_state_for_arm(arm)) {
+        RCLCPP_INFO(
+            logger,
+            "Primitive %d waiting for %s arm joint state before joint 7 rotation.",
+            primitive_value,
+            primitive_arm_name(arm));
+        return false;
+    }
+
+    auto target_joints = context.joint_state_for_arm(arm);
+    if (target_joints.size() < 7) {
+        RCLCPP_WARN(
+            logger,
+            "Primitive %d received incomplete %s arm joint state: %zu positions.",
+            primitive_value,
+            primitive_arm_name(arm),
+            target_joints.size());
+        return false;
+    }
+
+    target_joints[6] += angle;
+    RCLCPP_INFO(
+        logger,
+        "Primitive %d: rotating %s joint 7 by %.4f rad.",
+        primitive_value,
+        primitive_arm_name(arm),
+        angle);
+    context.start_joint_path(target_joints, n_segments, arm);
+    return true;
+}
+
 PrimitiveStatus execute_handoff_rotation_primitive(
     int primitive_value,
     PrimitiveArm held_arm,
     PrimitiveArm moving_arm,
     double yaw,
     int & phase,
-    geometry_msgs::msg::Pose & initial_moving_pose,
+    PrimitiveJointSnapshot & initial_joints,
     const geometry_msgs::msg::Pose & current_pose,
     const rclcpp::Logger & logger,
     const PrimitiveContext & context)
@@ -149,12 +257,14 @@ PrimitiveStatus execute_handoff_rotation_primitive(
         return PrimitiveStatus::RUNNING;
     }
 
-    const auto held_pose = context.pose_for_arm(held_arm);
+    auto held_pose = context.pose_for_arm(held_arm);
     const auto moving_pose = context.pose_for_arm(moving_arm);
 
     switch (phase) {
         case 0:
-            initial_moving_pose = moving_pose;
+            if (!capture_initial_joint_snapshot(primitive_value, initial_joints, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             print_primitive(primitive_value, current_pose, logger);
             RCLCPP_INFO(
                 logger,
@@ -183,36 +293,17 @@ PrimitiveStatus execute_handoff_rotation_primitive(
             return PrimitiveStatus::RUNNING;
 
         case 2: {
-            const auto moving_desired_pose = context.desired_pose_for_arm(moving_arm);
-            RCLCPP_INFO(
-                logger,
-                "Primitive %d: rotating %s end-effector around local z.",
-                primitive_value,
-                primitive_arm_name(moving_arm));
+            if (!start_last_joint_rotation(primitive_value, moving_arm, yaw, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             ++phase;
-            context.start_path(
-                context.hold_path(moving_desired_pose.position),
-                context.rotated_orientation_from(moving_desired_pose.orientation, 0.0, 0.0, yaw),
-                1,
-                moving_arm);
             return PrimitiveStatus::RUNNING;
         }
 
-        case 3: {
-            const auto moving_desired_pose = context.desired_pose_for_arm(moving_arm);
-            RCLCPP_INFO(
-                logger,
-                "Primitive %d: returning %s arm to initial pose.",
-                primitive_value,
-                primitive_arm_name(moving_arm));
+        case 3:
             ++phase;
-            context.start_path(
-                {moving_desired_pose.position, initial_moving_pose.position},
-                initial_moving_pose.orientation,
-                1,
-                moving_arm);
+            return_arm_to_initial_joints(primitive_value, moving_arm, initial_joints, 1, logger, context);
             return PrimitiveStatus::RUNNING;
-        }
 
         default:
             phase = 0;
@@ -227,14 +318,14 @@ PrimitiveStatus primitive_0(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_moving_pose;
+    static PrimitiveJointSnapshot initial_joints;
     return execute_handoff_rotation_primitive(
         0,
         PrimitiveArm::LEFT,
         PrimitiveArm::RIGHT,
         M_PI_2,
         phase,
-        initial_moving_pose,
+        initial_joints,
         current_pose,
         logger,
         context);
@@ -246,14 +337,14 @@ PrimitiveStatus primitive_1(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_moving_pose;
+    static PrimitiveJointSnapshot initial_joints;
     return execute_handoff_rotation_primitive(
         1,
         PrimitiveArm::LEFT,
         PrimitiveArm::RIGHT,
         -M_PI_2,
         phase,
-        initial_moving_pose,
+        initial_joints,
         current_pose,
         logger,
         context);
@@ -265,14 +356,14 @@ PrimitiveStatus primitive_2(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_moving_pose;
+    static PrimitiveJointSnapshot initial_joints;
     return execute_handoff_rotation_primitive(
         2,
         PrimitiveArm::RIGHT,
         PrimitiveArm::LEFT,
         M_PI_2,
         phase,
-        initial_moving_pose,
+        initial_joints,
         current_pose,
         logger,
         context);
@@ -284,14 +375,14 @@ PrimitiveStatus primitive_3(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_moving_pose;
+    static PrimitiveJointSnapshot initial_joints;
     return execute_handoff_rotation_primitive(
         3,
         PrimitiveArm::RIGHT,
         PrimitiveArm::LEFT,
         -M_PI_2,
         phase,
-        initial_moving_pose,
+        initial_joints,
         current_pose,
         logger,
         context);
@@ -303,14 +394,14 @@ PrimitiveStatus primitive_4(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_moving_pose;
+    static PrimitiveJointSnapshot initial_joints;
     return execute_handoff_rotation_primitive(
-        0,
+        4,
         PrimitiveArm::LEFT,
         PrimitiveArm::RIGHT,
         M_PI-0.0001,
         phase,
-        initial_moving_pose,
+        initial_joints,
         current_pose,
         logger,
         context);
@@ -322,14 +413,14 @@ PrimitiveStatus primitive_5(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_moving_pose;
+    static PrimitiveJointSnapshot initial_joints;
     return execute_handoff_rotation_primitive(
-        3,
+        5,
         PrimitiveArm::RIGHT,
         PrimitiveArm::LEFT,
         -M_PI + 0.0001,
         phase,
-        initial_moving_pose,
+        initial_joints,
         current_pose,
         logger,
         context);
@@ -341,7 +432,7 @@ PrimitiveStatus primitive_6(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_right_pose;
+    static PrimitiveJointSnapshot initial_joints;
     static std::vector<geometry_msgs::msg::Point> forward_path;
 
     if (!context.is_active_arm(PrimitiveArm::LEFT)) {
@@ -359,16 +450,30 @@ PrimitiveStatus primitive_6(
 
     switch (phase) {
         case 0: {
+            if (!capture_initial_joint_snapshot(6, initial_joints, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             print_primitive(6, current_pose, logger);
-            initial_right_pose = context.pose_for_arm(PrimitiveArm::RIGHT);
-            const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
             const auto left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
-            const auto far_approach_position = point_in_reference_frame(left_pose, 0.0, -0.118, 0.05);
-            const auto near_approach_position = point_in_reference_frame(left_pose, 0.0, -0.108, 0.05);
+            auto lifted_position = left_pose.position;
+            lifted_position.z += 0.10;
+            RCLCPP_INFO(logger, "Primitive 6: lifting left arm holding cube by 0.10 m in world z.");
+            ++phase;
+            context.start_path(
+                {left_pose.position, lifted_position},
+                left_pose.orientation,
+                1,
+                PrimitiveArm::LEFT);
+            return PrimitiveStatus::RUNNING;
+        }
+
+        case 1: {
+            const auto right_pose = context.pose_for_arm(PrimitiveArm::RIGHT);
+            const auto left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
+            const auto near_approach_position = point_in_reference_frame(left_pose, 0.0, -0.07, 0.05);
             const auto target_position = point_in_reference_frame(left_pose, 0.0, -0.058, 0.05);
             forward_path = context.build_path({
-                right_desired_pose.position,
-                far_approach_position,
+                right_pose.position,
                 near_approach_position,
                 target_position});
             RCLCPP_INFO(
@@ -377,41 +482,29 @@ PrimitiveStatus primitive_6(
             ++phase;
             context.start_path(
                 forward_path,
-                align_moving_z_with_reference_y(right_desired_pose.orientation, left_pose.orientation),
+                align_moving_z_with_reference_y(right_pose.orientation, left_pose.orientation),
                 2,
-                PrimitiveArm::RIGHT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 1: {
-            const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
-            RCLCPP_INFO(logger, "Primitive 6: rotating right end-effector pi/2 around local z.");
-            ++phase;
-            context.start_path(
-                context.hold_path(right_desired_pose.position),
-                context.rotated_orientation_from(right_desired_pose.orientation, 0.0, 0.0, M_PI_2-0.01),
-                1,
                 PrimitiveArm::RIGHT);
             return PrimitiveStatus::RUNNING;
         }
 
         case 2: {
-            auto return_path = forward_path;
-            std::reverse(return_path.begin(), return_path.end());
-            if (return_path.empty()) {
-                return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::RIGHT).position,
-                    initial_right_pose.position};
+            if (!start_last_joint_rotation(6, PrimitiveArm::RIGHT, M_PI_2, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
             }
-            RCLCPP_INFO(logger, "Primitive 6: returning right arm along the exact reversed sampled path.");
             ++phase;
-            context.start_path(
-                return_path,
-                initial_right_pose.orientation,
-                2,
-                PrimitiveArm::RIGHT);
             return PrimitiveStatus::RUNNING;
         }
+
+        case 3:
+            ++phase;
+            return_arm_to_initial_joints(6, PrimitiveArm::RIGHT, initial_joints, 2, logger, context);
+            return PrimitiveStatus::RUNNING;
+
+        case 4:
+            ++phase;
+            return_arm_to_initial_joints(6, PrimitiveArm::LEFT, initial_joints, 1, logger, context);
+            return PrimitiveStatus::RUNNING;
 
         default:
             phase = 0;
@@ -427,7 +520,7 @@ PrimitiveStatus execute_right_reference_frame_rotation_primitive(
     double yaw,
     bool align_negative_y,
     int & phase,
-    geometry_msgs::msg::Pose & initial_right_pose,
+    PrimitiveJointSnapshot & initial_joints,
     const geometry_msgs::msg::Pose & current_pose,
     const rclcpp::Logger & logger,
     const PrimitiveContext & context)
@@ -453,8 +546,10 @@ PrimitiveStatus execute_right_reference_frame_rotation_primitive(
 
     switch (phase) {
         case 0: {
+            if (!capture_initial_joint_snapshot(primitive_value, initial_joints, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             print_primitive(primitive_value, current_pose, logger);
-            initial_right_pose = context.pose_for_arm(PrimitiveArm::RIGHT);
             const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
             const auto left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
             const auto far_approach_position = point_in_reference_frame(left_pose, 0.0, far_approach_y, 0.05);
@@ -482,56 +577,17 @@ PrimitiveStatus execute_right_reference_frame_rotation_primitive(
         }
 
         case 1: {
-            const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
-            RCLCPP_INFO(
-                logger,
-                "Primitive %d: rotating right end-effector halfway around local z.",
-                primitive_value);
+            if (!start_last_joint_rotation(primitive_value, PrimitiveArm::RIGHT, yaw, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             ++phase;
-            context.start_path(
-                context.hold_path(right_desired_pose.position),
-                context.rotated_orientation_from(right_desired_pose.orientation, 0.0, 0.0, yaw / 2.0),
-                1,
-                PrimitiveArm::RIGHT);
             return PrimitiveStatus::RUNNING;
         }
 
-        case 2: {
-            const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
-            RCLCPP_INFO(
-                logger,
-                "Primitive %d: finishing right end-effector local z rotation.",
-                primitive_value);
+        case 2:
             ++phase;
-            context.start_path(
-                context.hold_path(right_desired_pose.position),
-                context.rotated_orientation_from(right_desired_pose.orientation, 0.0, 0.0, yaw / 2.0),
-                1,
-                PrimitiveArm::RIGHT);
+            return_arm_to_initial_joints(primitive_value, PrimitiveArm::RIGHT, initial_joints, 2, logger, context);
             return PrimitiveStatus::RUNNING;
-        }
-
-        case 3: {
-            const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
-            const auto left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
-            const auto near_return_approach = point_in_reference_frame(left_pose, 0.0, near_approach_y, 0.05);
-            const auto far_return_approach = point_in_reference_frame(left_pose, 0.0, far_approach_y, 0.05);
-            RCLCPP_INFO(
-                logger,
-                "Primitive %d: returning right arm through approach waypoint to initial pose.",
-                primitive_value);
-            ++phase;
-            context.start_path(
-                context.build_path({
-                    right_desired_pose.position,
-                    near_return_approach,
-                    far_return_approach,
-                    initial_right_pose.position}),
-                initial_right_pose.orientation,
-                2,
-                PrimitiveArm::RIGHT);
-            return PrimitiveStatus::RUNNING;
-        }
 
         default:
             phase = 0;
@@ -546,7 +602,7 @@ PrimitiveStatus primitive_7(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_right_pose;
+    static PrimitiveJointSnapshot initial_joints;
     static std::vector<geometry_msgs::msg::Point> forward_path;
 
     if (!context.is_active_arm(PrimitiveArm::LEFT)) {
@@ -564,16 +620,30 @@ PrimitiveStatus primitive_7(
 
     switch (phase) {
         case 0: {
+            if (!capture_initial_joint_snapshot(6, initial_joints, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             print_primitive(6, current_pose, logger);
-            initial_right_pose = context.pose_for_arm(PrimitiveArm::RIGHT);
+            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
+            auto lifted_position = left_desired_pose.position;
+            lifted_position.z += 0.10;
+            RCLCPP_INFO(logger, "Primitive 6: lifting left arm holding cube by 0.10 m in world z.");
+            ++phase;
+            context.start_path(
+                {left_desired_pose.position, lifted_position},
+                left_desired_pose.orientation,
+                1,
+                PrimitiveArm::LEFT);
+            return PrimitiveStatus::RUNNING;
+        }
+
+        case 1: {
             const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
             const auto left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
-            const auto far_approach_position = point_in_reference_frame(left_pose, 0.0, -0.118, 0.05);
-            const auto near_approach_position = point_in_reference_frame(left_pose, 0.0, -0.108, 0.05);
+            const auto near_approach_position = point_in_reference_frame(left_pose, 0.0, -0.07, 0.05);
             const auto target_position = point_in_reference_frame(left_pose, 0.0, -0.058, 0.05);
             forward_path = context.build_path({
                 right_desired_pose.position,
-                far_approach_position,
                 near_approach_position,
                 target_position});
             RCLCPP_INFO(
@@ -588,35 +658,23 @@ PrimitiveStatus primitive_7(
             return PrimitiveStatus::RUNNING;
         }
 
-        case 1: {
-            const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
-            RCLCPP_INFO(logger, "Primitive 6: rotating right end-effector pi/2 around local z.");
+        case 2: {
+            if (!start_last_joint_rotation(6, PrimitiveArm::RIGHT, -M_PI_2, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             ++phase;
-            context.start_path(
-                context.hold_path(right_desired_pose.position),
-                context.rotated_orientation_from(right_desired_pose.orientation, 0.0, 0.0, -M_PI_2+0.01),
-                1,
-                PrimitiveArm::RIGHT);
             return PrimitiveStatus::RUNNING;
         }
 
-        case 2: {
-            auto return_path = forward_path;
-            std::reverse(return_path.begin(), return_path.end());
-            if (return_path.empty()) {
-                return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::RIGHT).position,
-                    initial_right_pose.position};
-            }
-            RCLCPP_INFO(logger, "Primitive 6: returning right arm along the exact reversed sampled path.");
+        case 3:
             ++phase;
-            context.start_path(
-                return_path,
-                initial_right_pose.orientation,
-                2,
-                PrimitiveArm::RIGHT);
+            return_arm_to_initial_joints(6, PrimitiveArm::RIGHT, initial_joints, 2, logger, context);
             return PrimitiveStatus::RUNNING;
-        }
+
+        case 4:
+            ++phase;
+            return_arm_to_initial_joints(6, PrimitiveArm::LEFT, initial_joints, 1, logger, context);
+            return PrimitiveStatus::RUNNING;
 
         default:
             phase = 0;
@@ -632,14 +690,14 @@ PrimitiveStatus primitive_8(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_right_pose;
+    static PrimitiveJointSnapshot initial_joints;
     return execute_right_reference_frame_rotation_primitive(
         8,
         0.058,
         M_PI_2 - 0.01,
         true,
         phase,
-        initial_right_pose,
+        initial_joints,
         current_pose,
         logger,
         context);
@@ -651,14 +709,14 @@ PrimitiveStatus primitive_9(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_right_pose;
+    static PrimitiveJointSnapshot initial_joints;
     return execute_right_reference_frame_rotation_primitive(
         9,
         0.058,
         M_PI_2 - 0.01,
         true,
         phase,
-        initial_right_pose,
+        initial_joints,
         current_pose,
         logger,
         context);
@@ -670,8 +728,7 @@ PrimitiveStatus primitive_10(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_left_pose;
-    static geometry_msgs::msg::Pose initial_right_pose;
+    static PrimitiveJointSnapshot initial_joints;
     static std::vector<geometry_msgs::msg::Point> right_forward_path;
     static std::vector<geometry_msgs::msg::Point> left_forward_path;
 
@@ -692,9 +749,9 @@ PrimitiveStatus primitive_10(
     switch (phase) {
         case 0: {
             print_primitive(10, current_pose, logger);
-            initial_left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
-            initial_right_pose = context.pose_for_arm(PrimitiveArm::RIGHT);
-
+            if (!capture_initial_joint_snapshot(10, initial_joints, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
             auto target_position = right_desired_pose.position;
             target_position.x += 0.23;
@@ -711,14 +768,10 @@ PrimitiveStatus primitive_10(
         }
 
         case 1: {
-            const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
-            RCLCPP_INFO(logger, "Primitive 10: rotating right end-effector M_PI around local z.");
+            if (!start_last_joint_rotation(10, PrimitiveArm::RIGHT, M_PI, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             ++phase;
-            context.start_path(
-                context.hold_path(right_desired_pose.position),
-                context.rotated_orientation_from(right_desired_pose.orientation, 0.0, 0.0, M_PI),
-                1,
-                PrimitiveArm::RIGHT);
             return PrimitiveStatus::RUNNING;
         }
 
@@ -748,64 +801,22 @@ PrimitiveStatus primitive_10(
         }
 
         case 3: {
-            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
-            RCLCPP_INFO(logger, "Primitive 10: rotating left end-effector halfway around local z.");
-            ++phase;
-            context.start_path(
-                context.hold_path(left_desired_pose.position),
-                context.rotated_orientation_from(left_desired_pose.orientation, 0.0, 0.0, (M_PI_2 - 0.01) / 2.0),
-                1,
-                PrimitiveArm::LEFT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 4: {
-            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
-            RCLCPP_INFO(logger, "Primitive 10: finishing left end-effector local z rotation.");
-            ++phase;
-            context.start_path(
-                context.hold_path(left_desired_pose.position),
-                context.rotated_orientation_from(left_desired_pose.orientation, 0.0, 0.0, (M_PI_2 - 0.01) / 2.0),
-                1,
-                PrimitiveArm::LEFT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 5: {
-            auto left_return_path = left_forward_path;
-            std::reverse(left_return_path.begin(), left_return_path.end());
-            if (left_return_path.empty()) {
-                left_return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::LEFT).position,
-                    initial_left_pose.position};
+            if (!start_last_joint_rotation(10, PrimitiveArm::LEFT, M_PI_2 - 0.01, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
             }
-            RCLCPP_INFO(logger, "Primitive 10: returning left arm along the exact reversed sampled path.");
             ++phase;
-            context.start_path(
-                left_return_path,
-                initial_left_pose.orientation,
-                2,
-                PrimitiveArm::LEFT);
             return PrimitiveStatus::RUNNING;
         }
 
-        case 6: {
-            auto right_return_path = right_forward_path;
-            std::reverse(right_return_path.begin(), right_return_path.end());
-            if (right_return_path.empty()) {
-                right_return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::RIGHT).position,
-                    initial_right_pose.position};
-            }
-            RCLCPP_INFO(logger, "Primitive 10: returning right arm along the exact reversed sampled path.");
+        case 4:
             ++phase;
-            context.start_path(
-                right_return_path,
-                initial_right_pose.orientation,
-                2,
-                PrimitiveArm::RIGHT);
+            return_arm_to_initial_joints(10, PrimitiveArm::LEFT, initial_joints, 2, logger, context);
             return PrimitiveStatus::RUNNING;
-        }
+
+        case 5:
+            ++phase;
+            return_arm_to_initial_joints(10, PrimitiveArm::RIGHT, initial_joints, 2, logger, context);
+            return PrimitiveStatus::RUNNING;
 
         default:
             phase = 0;
@@ -822,8 +833,7 @@ PrimitiveStatus primitive_11(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_left_pose;
-    static geometry_msgs::msg::Pose initial_right_pose;
+    static PrimitiveJointSnapshot initial_joints;
     static std::vector<geometry_msgs::msg::Point> right_forward_path;
     static std::vector<geometry_msgs::msg::Point> left_forward_path;
 
@@ -844,8 +854,9 @@ PrimitiveStatus primitive_11(
     switch (phase) {
         case 0: {
             print_primitive(11, current_pose, logger);
-            initial_left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
-            initial_right_pose = context.pose_for_arm(PrimitiveArm::RIGHT);
+            if (!capture_initial_joint_snapshot(11, initial_joints, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
 
             const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
             auto target_position = right_desired_pose.position;
@@ -888,64 +899,22 @@ PrimitiveStatus primitive_11(
         }
 
         case 2: {
-            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
-            RCLCPP_INFO(logger, "Primitive 11: rotating left end-effector halfway around local z.");
-            ++phase;
-            context.start_path(
-                context.hold_path(left_desired_pose.position),
-                context.rotated_orientation_from(left_desired_pose.orientation, 0.0, 0.0, (M_PI_2 - 0.01) / 2.0),
-                1,
-                PrimitiveArm::LEFT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 3: {
-            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
-            RCLCPP_INFO(logger, "Primitive 11: finishing left end-effector local z rotation.");
-            ++phase;
-            context.start_path(
-                context.hold_path(left_desired_pose.position),
-                context.rotated_orientation_from(left_desired_pose.orientation, 0.0, 0.0, (M_PI_2 - 0.01) / 2.0),
-                1,
-                PrimitiveArm::LEFT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 4: {
-            RCLCPP_INFO(logger, "Primitive 11: returning left arm through approach waypoints to initial pose.");
-            ++phase;
-            auto left_return_path = left_forward_path;
-            std::reverse(left_return_path.begin(), left_return_path.end());
-            if (left_return_path.empty()) {
-                left_return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::LEFT).position,
-                    initial_left_pose.position};
+            if (!start_last_joint_rotation(11, PrimitiveArm::LEFT, M_PI_2 - 0.01, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
             }
-            context.start_path(
-                left_return_path,
-                initial_left_pose.orientation,
-                2,
-                PrimitiveArm::LEFT);
+            ++phase;
             return PrimitiveStatus::RUNNING;
         }
 
-        case 5: {
-            RCLCPP_INFO(logger, "Primitive 11: returning right arm through intermediate pose to initial pose.");
+        case 3:
             ++phase;
-            auto right_return_path = right_forward_path;
-            std::reverse(right_return_path.begin(), right_return_path.end());
-            if (right_return_path.empty()) {
-                right_return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::RIGHT).position,
-                    initial_right_pose.position};
-            }
-            context.start_path(
-                right_return_path,
-                initial_right_pose.orientation,
-                2,
-                PrimitiveArm::RIGHT);
+            return_arm_to_initial_joints(11, PrimitiveArm::LEFT, initial_joints, 2, logger, context);
             return PrimitiveStatus::RUNNING;
-        }
+
+        case 4:
+            ++phase;
+            return_arm_to_initial_joints(11, PrimitiveArm::RIGHT, initial_joints, 2, logger, context);
+            return PrimitiveStatus::RUNNING;
 
         default:
             phase = 0;
@@ -962,8 +931,7 @@ PrimitiveStatus primitive_12(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_left_pose;
-    static geometry_msgs::msg::Pose initial_right_pose;
+    static PrimitiveJointSnapshot initial_joints;
     static std::vector<geometry_msgs::msg::Point> right_forward_path;
     static std::vector<geometry_msgs::msg::Point> left_forward_path;
 
@@ -971,28 +939,29 @@ PrimitiveStatus primitive_12(
         phase = 0;
         right_forward_path.clear();
         left_forward_path.clear();
-        RCLCPP_INFO(logger, "Primitive 10 requires right active arm. Requesting CHANGE_ARM.");
+        RCLCPP_INFO(logger, "Primitive 12 requires right active arm. Requesting CHANGE_ARM.");
         context.request_change_arm();
         return PrimitiveStatus::RUNNING;
     }
 
     if (!context.has_pose_for_arm(PrimitiveArm::LEFT)) {
-        RCLCPP_INFO(logger, "Primitive 10 waiting for left arm pose.");
+        RCLCPP_INFO(logger, "Primitive 12 waiting for left arm pose.");
         return PrimitiveStatus::RUNNING;
     }
 
     switch (phase) {
         case 0: {
-            print_primitive(10, current_pose, logger);
-            initial_left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
-            initial_right_pose = context.pose_for_arm(PrimitiveArm::RIGHT);
+            print_primitive(12, current_pose, logger);
+            if (!capture_initial_joint_snapshot(12, initial_joints, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
 
             const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
             auto target_position = right_desired_pose.position;
             target_position.x += 0.23;
 
             right_forward_path = context.build_path({right_desired_pose.position, target_position});
-            RCLCPP_INFO(logger, "Primitive 10: moving right arm +0.17 on sampled world-x path.");
+            RCLCPP_INFO(logger, "Primitive 12: moving right arm +0.17 on sampled world-x path.");
             ++phase;
             context.start_path(
                 right_forward_path,
@@ -1003,14 +972,10 @@ PrimitiveStatus primitive_12(
         }
 
         case 1: {
-            const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
-            RCLCPP_INFO(logger, "Primitive 10: rotating right end-effector M_PI around local z.");
+            if (!start_last_joint_rotation(12, PrimitiveArm::RIGHT, M_PI, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
             ++phase;
-            context.start_path(
-                context.hold_path(right_desired_pose.position),
-                context.rotated_orientation_from(right_desired_pose.orientation, 0.0, 0.0, M_PI),
-                1,
-                PrimitiveArm::RIGHT);
             return PrimitiveStatus::RUNNING;
         }
 
@@ -1029,7 +994,7 @@ PrimitiveStatus primitive_12(
                 far_approach_position,
                 near_approach_position,
                 final_position});
-            RCLCPP_INFO(logger, "Primitive 10: moving left arm through sampled approach path to final aligned pose.");
+            RCLCPP_INFO(logger, "Primitive 12: moving left arm through sampled approach path to final aligned pose.");
             ++phase;
             context.start_path(
                 left_forward_path,
@@ -1040,64 +1005,22 @@ PrimitiveStatus primitive_12(
         }
 
         case 3: {
-            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
-            RCLCPP_INFO(logger, "Primitive 10: rotating left end-effector halfway around local z.");
-            ++phase;
-            context.start_path(
-                context.hold_path(left_desired_pose.position),
-                context.rotated_orientation_from(left_desired_pose.orientation, 0.0, 0.0, (-M_PI_2 + 0.01) / 2.0),
-                1,
-                PrimitiveArm::LEFT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 4: {
-            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
-            RCLCPP_INFO(logger, "Primitive 10: finishing left end-effector local z rotation.");
-            ++phase;
-            context.start_path(
-                context.hold_path(left_desired_pose.position),
-                context.rotated_orientation_from(left_desired_pose.orientation, 0.0, 0.0, (-M_PI_2 + 0.01) / 2.0),
-                1,
-                PrimitiveArm::LEFT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 5: {
-            auto left_return_path = left_forward_path;
-            std::reverse(left_return_path.begin(), left_return_path.end());
-            if (left_return_path.empty()) {
-                left_return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::LEFT).position,
-                    initial_left_pose.position};
+            if (!start_last_joint_rotation(12, PrimitiveArm::LEFT, -M_PI_2 + 0.01, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
             }
-            RCLCPP_INFO(logger, "Primitive 10: returning left arm along the exact reversed sampled path.");
             ++phase;
-            context.start_path(
-                left_return_path,
-                initial_left_pose.orientation,
-                2,
-                PrimitiveArm::LEFT);
             return PrimitiveStatus::RUNNING;
         }
 
-        case 6: {
-            auto right_return_path = right_forward_path;
-            std::reverse(right_return_path.begin(), right_return_path.end());
-            if (right_return_path.empty()) {
-                right_return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::RIGHT).position,
-                    initial_right_pose.position};
-            }
-            RCLCPP_INFO(logger, "Primitive 10: returning right arm along the exact reversed sampled path.");
+        case 4:
             ++phase;
-            context.start_path(
-                right_return_path,
-                initial_right_pose.orientation,
-                2,
-                PrimitiveArm::RIGHT);
+            return_arm_to_initial_joints(12, PrimitiveArm::LEFT, initial_joints, 2, logger, context);
             return PrimitiveStatus::RUNNING;
-        }
+
+        case 5:
+            ++phase;
+            return_arm_to_initial_joints(12, PrimitiveArm::RIGHT, initial_joints, 2, logger, context);
+            return PrimitiveStatus::RUNNING;
 
         default:
             phase = 0;
@@ -1114,8 +1037,7 @@ PrimitiveStatus primitive_13(
     const PrimitiveContext & context)
 {
     static int phase = 0;
-    static geometry_msgs::msg::Pose initial_left_pose;
-    static geometry_msgs::msg::Pose initial_right_pose;
+    static PrimitiveJointSnapshot initial_joints;
     static std::vector<geometry_msgs::msg::Point> right_forward_path;
     static std::vector<geometry_msgs::msg::Point> left_forward_path;
 
@@ -1123,27 +1045,28 @@ PrimitiveStatus primitive_13(
         phase = 0;
         right_forward_path.clear();
         left_forward_path.clear();
-        RCLCPP_INFO(logger, "Primitive 11 requires right active arm. Requesting CHANGE_ARM.");
+        RCLCPP_INFO(logger, "Primitive 13 requires right active arm. Requesting CHANGE_ARM.");
         context.request_change_arm();
         return PrimitiveStatus::RUNNING;
     }
 
     if (!context.has_pose_for_arm(PrimitiveArm::LEFT)) {
-        RCLCPP_INFO(logger, "Primitive 11 waiting for left arm pose.");
+        RCLCPP_INFO(logger, "Primitive 13 waiting for left arm pose.");
         return PrimitiveStatus::RUNNING;
     }
 
     switch (phase) {
         case 0: {
-            print_primitive(11, current_pose, logger);
-            initial_left_pose = context.pose_for_arm(PrimitiveArm::LEFT);
-            initial_right_pose = context.pose_for_arm(PrimitiveArm::RIGHT);
+            print_primitive(13, current_pose, logger);
+            if (!capture_initial_joint_snapshot(13, initial_joints, logger, context)) {
+                return PrimitiveStatus::RUNNING;
+            }
 
             const auto right_desired_pose = context.desired_pose_for_arm(PrimitiveArm::RIGHT);
             auto target_position = right_desired_pose.position;
             target_position.x += 0.23;
 
-            RCLCPP_INFO(logger, "Primitive 11: moving right arm -0.07 on world x.");
+            RCLCPP_INFO(logger, "Primitive 13: moving right arm -0.07 on world x.");
             ++phase;
             right_forward_path = context.build_path({right_desired_pose.position, target_position});
             context.start_path(
@@ -1164,7 +1087,7 @@ PrimitiveStatus primitive_13(
                 left_desired_pose.orientation,
                 right_desired_pose.orientation);
 
-            RCLCPP_INFO(logger, "Primitive 11: moving left arm through approach waypoint to final aligned pose.");
+            RCLCPP_INFO(logger, "Primitive 13: moving left arm through approach waypoint to final aligned pose.");
             ++phase;
             left_forward_path = context.build_path({
                 left_desired_pose.position,
@@ -1180,64 +1103,22 @@ PrimitiveStatus primitive_13(
         }
 
         case 2: {
-            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
-            RCLCPP_INFO(logger, "Primitive 11: rotating left end-effector halfway around local z.");
-            ++phase;
-            context.start_path(
-                context.hold_path(left_desired_pose.position),
-                context.rotated_orientation_from(left_desired_pose.orientation, 0.0, 0.0, (-M_PI_2 + 0.01) / 2.0),
-                1,
-                PrimitiveArm::LEFT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 3: {
-            const auto left_desired_pose = context.desired_pose_for_arm(PrimitiveArm::LEFT);
-            RCLCPP_INFO(logger, "Primitive 11: finishing left end-effector local z rotation.");
-            ++phase;
-            context.start_path(
-                context.hold_path(left_desired_pose.position),
-                context.rotated_orientation_from(left_desired_pose.orientation, 0.0, 0.0, (-M_PI_2 + 0.01) / 2.0),
-                1,
-                PrimitiveArm::LEFT);
-            return PrimitiveStatus::RUNNING;
-        }
-
-        case 4: {
-            RCLCPP_INFO(logger, "Primitive 11: returning left arm through approach waypoints to initial pose.");
-            ++phase;
-            auto left_return_path = left_forward_path;
-            std::reverse(left_return_path.begin(), left_return_path.end());
-            if (left_return_path.empty()) {
-                left_return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::LEFT).position,
-                    initial_left_pose.position};
+            if (!start_last_joint_rotation(13, PrimitiveArm::LEFT, -M_PI_2 + 0.01, 1, logger, context)) {
+                return PrimitiveStatus::RUNNING;
             }
-            context.start_path(
-                left_return_path,
-                initial_left_pose.orientation,
-                2,
-                PrimitiveArm::LEFT);
+            ++phase;
             return PrimitiveStatus::RUNNING;
         }
 
-        case 5: {
-            RCLCPP_INFO(logger, "Primitive 11: returning right arm through intermediate pose to initial pose.");
+        case 3:
             ++phase;
-            auto right_return_path = right_forward_path;
-            std::reverse(right_return_path.begin(), right_return_path.end());
-            if (right_return_path.empty()) {
-                right_return_path = {
-                    context.desired_pose_for_arm(PrimitiveArm::RIGHT).position,
-                    initial_right_pose.position};
-            }
-            context.start_path(
-                right_return_path,
-                initial_right_pose.orientation,
-                2,
-                PrimitiveArm::RIGHT);
+            return_arm_to_initial_joints(13, PrimitiveArm::LEFT, initial_joints, 2, logger, context);
             return PrimitiveStatus::RUNNING;
-        }
+
+        case 4:
+            ++phase;
+            return_arm_to_initial_joints(13, PrimitiveArm::RIGHT, initial_joints, 2, logger, context);
+            return PrimitiveStatus::RUNNING;
 
         default:
             phase = 0;

@@ -24,10 +24,12 @@ enum class PrimitiveStatus {
 struct PrimitiveContext {
     std::function<bool(PrimitiveArm)> is_active_arm;
     std::function<bool(PrimitiveArm)> has_pose_for_arm;
+    std::function<bool(PrimitiveArm)> has_joint_state_for_arm;
     std::function<bool()> waiting_for_gripper;
     std::function<void()> request_change_arm;
     std::function<void(bool, PrimitiveArm)> send_gripper_command;
     std::function<geometry_msgs::msg::Pose(PrimitiveArm)> pose_for_arm;
+    std::function<std::vector<double>(PrimitiveArm)> joint_state_for_arm;
     std::function<geometry_msgs::msg::Pose(PrimitiveArm)> desired_pose_for_arm;
     std::function<std::vector<geometry_msgs::msg::Point>(
         const geometry_msgs::msg::Point &,
@@ -47,6 +49,14 @@ struct PrimitiveContext {
         const geometry_msgs::msg::Quaternion &,
         int,
         PrimitiveArm)> start_path;
+    std::function<void(
+        const std::vector<double> &,
+        int,
+        PrimitiveArm)> start_joint_path;
+    std::function<void(
+        double,
+        int,
+        PrimitiveArm)> rotate_last_joint;
     std::function<std::vector<geometry_msgs::msg::Point>(
         const std::vector<geometry_msgs::msg::Point> &)> build_path;
     std::function<void()> restore_active_pose;
