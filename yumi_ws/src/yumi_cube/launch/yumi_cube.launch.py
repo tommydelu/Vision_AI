@@ -21,4 +21,11 @@ def generate_launch_description():
             name="sequence_parser_node",
             output="screen",
         ),
+
+        Node(
+            package="yumi_cube",
+            executable="locate_cube_node", # Sostituisci col nome esatto che hai messo nel setup.py
+            name="locate_cube_node_LINUX",
+            output="screen",
+        ),
     ])
